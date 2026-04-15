@@ -1,167 +1,219 @@
 import { useState, useCallback, useMemo } from 'react';
-import * as XLSX from 'xlsx';
-import type { ColumnInfo, RowData } from '../types';
+import { invoke } from '@tauri-apps/api/core';
+import { open, save } from '@tauri-apps/plugin-dialog';
+import type { ColumnInfo, RowData, OpenResult, PageResult } from '../types';
 
 export function useExcelData() {
-  const [fileName, setFileName] = useState<string>('');
+  const [fileName, setFileName] = useState('');
   const [columns, setColumns] = useState<ColumnInfo[]>([]);
-  const [rows, setRows] = useState<RowData[]>([]);
   const [selectedColumnKeys, setSelectedColumnKeys] = useState<string[]>([]);
   const [filters, setFilters] = useState<Record<string, string[]>>({});
   const [loading, setLoading] = useState(false);
   const [sheetNames, setSheetNames] = useState<string[]>([]);
-  const [activeSheet, setActiveSheet] = useState<string>('');
-  const [workbook, setWorkbook] = useState<XLSX.WorkBook | null>(null);
+  const [activeSheet, setActiveSheet] = useState('');
+  const [totalRows, setTotalRows] = useState(0);
 
-  const parseSheet = useCallback((wb: XLSX.WorkBook, sheetName: string) => {
-    const ws = wb.Sheets[sheetName];
-    if (!ws) return;
+  // Current page data
+  const [pageRows, setPageRows] = useState<RowData[]>([]);
+  const [filteredTotal, setFilteredTotal] = useState(0);
+  const [currentPage, setCurrentPage] = useState(0);
+  const [pageSize, setPageSize] = useState(100);
 
-    const jsonData = XLSX.utils.sheet_to_json<RowData>(ws, { defval: '' });
-    if (jsonData.length === 0) {
-      setColumns([]);
-      setRows([]);
-      setSelectedColumnKeys([]);
-      setFilters({});
-      return;
-    }
+  // Fetch a page of data from Rust backend
+  const fetchPage = useCallback(
+    async (
+      sheet: string,
+      page: number,
+      size: number,
+      selCols: string[],
+      currentFilters: Record<string, string[]>
+    ) => {
+      const result = await invoke<PageResult>('get_page', {
+        sheetName: sheet,
+        page,
+        pageSize: size,
+        selectedColumns: selCols,
+        filters: currentFilters,
+      });
+      setPageRows(result.rows);
+      setFilteredTotal(result.total);
+      setCurrentPage(result.page);
+    },
+    []
+  );
 
-    // Extract columns from headers
-    const headers = Object.keys(jsonData[0]);
-    const cols: ColumnInfo[] = headers.map((header, index) => ({
-      key: header,
-      title: header,
-      index,
-    }));
+  // Open file via Tauri dialog
+  const openFile = useCallback(async () => {
+    const selected = await open({
+      multiple: false,
+      filters: [
+        { name: 'Excel', extensions: ['xlsx', 'xls', 'csv'] },
+      ],
+    });
+    if (!selected) return;
 
-    setColumns(cols);
-    setRows(jsonData);
-    setSelectedColumnKeys(headers);
-    setFilters({});
-    setActiveSheet(sheetName);
-  }, []);
-
-  const loadFile = useCallback((file: File) => {
     setLoading(true);
-    setFileName(file.name);
+    try {
+      const result = await invoke<OpenResult>('open_file', {
+        path: selected,
+      });
+      setFileName(result.file_name);
+      setSheetNames(result.sheet_names);
+      setColumns(result.columns);
+      setTotalRows(result.total_rows);
+      const allKeys = result.columns.map((c) => c.key);
+      setSelectedColumnKeys(allKeys);
+      setFilters({});
+      setActiveSheet(result.sheet_names[0] || '');
+      setCurrentPage(0);
 
-    const reader = new FileReader();
-    reader.onload = (e) => {
+      // Fetch first page
+      await fetchPage(result.sheet_names[0] || '', 0, pageSize, allKeys, {});
+    } finally {
+      setLoading(false);
+    }
+  }, [fetchPage, pageSize]);
+
+  // Switch sheet
+  const switchSheet = useCallback(
+    async (sheetName: string) => {
+      setLoading(true);
       try {
-        const data = new Uint8Array(e.target?.result as ArrayBuffer);
-        const wb = XLSX.read(data, { type: 'array' });
+        const [cols, total] = await invoke<[ColumnInfo[], number]>('switch_sheet', {
+          sheetName,
+        });
+        setColumns(cols);
+        setTotalRows(total);
+        const allKeys = cols.map((c) => c.key);
+        setSelectedColumnKeys(allKeys);
+        setFilters({});
+        setActiveSheet(sheetName);
+        setCurrentPage(0);
 
-        setWorkbook(wb);
-        setSheetNames(wb.SheetNames);
-
-        // Parse first sheet by default
-        if (wb.SheetNames.length > 0) {
-          parseSheet(wb, wb.SheetNames[0]);
-        }
+        await fetchPage(sheetName, 0, pageSize, allKeys, {});
       } finally {
         setLoading(false);
       }
-    };
-    reader.readAsArrayBuffer(file);
-  }, [parseSheet]);
+    },
+    [fetchPage, pageSize]
+  );
 
-  const switchSheet = useCallback((sheetName: string) => {
-    if (workbook) {
-      parseSheet(workbook, sheetName);
-    }
-  }, [workbook, parseSheet]);
+  // Page change
+  const onPageChange = useCallback(
+    async (page: number, size: number) => {
+      setPageSize(size);
+      await fetchPage(activeSheet, page, size, selectedColumnKeys, filters);
+    },
+    [activeSheet, selectedColumnKeys, filters, fetchPage]
+  );
 
-  const updateFilter = useCallback((column: string, values: string[]) => {
-    setFilters(prev => {
-      const next = { ...prev };
+  // Update filters
+  const updateFilter = useCallback(
+    async (column: string, values: string[]) => {
+      const next = { ...filters };
       if (values.length === 0) {
         delete next[column];
       } else {
         next[column] = values;
       }
-      return next;
-    });
-  }, []);
+      setFilters(next);
+      setCurrentPage(0);
+      await fetchPage(activeSheet, 0, pageSize, selectedColumnKeys, next);
+    },
+    [filters, activeSheet, pageSize, selectedColumnKeys, fetchPage]
+  );
 
-  const clearAllFilters = useCallback(() => {
+  const clearAllFilters = useCallback(async () => {
     setFilters({});
-  }, []);
+    setCurrentPage(0);
+    await fetchPage(activeSheet, 0, pageSize, selectedColumnKeys, {});
+  }, [activeSheet, pageSize, selectedColumnKeys, fetchPage]);
 
-  // Compute visible columns based on selection
+  // Update selected columns — refetch to show correct columns
+  const updateSelectedColumns = useCallback(
+    async (keys: string[]) => {
+      setSelectedColumnKeys(keys);
+      setCurrentPage(0);
+      await fetchPage(activeSheet, 0, pageSize, keys, filters);
+    },
+    [activeSheet, pageSize, filters, fetchPage]
+  );
+
+  // Visible columns
   const visibleColumns = useMemo(() => {
-    return columns.filter(col => selectedColumnKeys.includes(col.key));
+    return columns.filter((col) => selectedColumnKeys.includes(col.key));
   }, [columns, selectedColumnKeys]);
 
-  // Compute filtered rows
-  const filteredRows = useMemo(() => {
-    if (Object.keys(filters).length === 0) return rows;
-
-    return rows.filter(row => {
-      return Object.entries(filters).every(([column, allowedValues]) => {
-        const cellValue = String(row[column] ?? '');
-        return allowedValues.includes(cellValue);
+  // Fetch unique values for a column (for filter dropdowns)
+  const getColumnUniqueValues = useCallback(
+    async (columnKey: string): Promise<string[]> => {
+      return invoke<string[]>('get_unique_values', {
+        sheetName: activeSheet,
+        columnKey,
+        filters,
       });
+    },
+    [activeSheet, filters]
+  );
+
+  // Export
+  const exportData = useCallback(async () => {
+    const outputPath = await save({
+      filters: [{ name: 'Excel', extensions: ['xlsx'] }],
+      defaultPath: fileName.replace(/\.[^/.]+$/, '') + '_exported.xlsx',
     });
-  }, [rows, filters]);
+    if (!outputPath) return;
 
-  // Get unique values for a column (for filter dropdowns)
-  const getColumnUniqueValues = useCallback((columnKey: string): string[] => {
-    const valueSet = new Set<string>();
-    rows.forEach(row => {
-      valueSet.add(String(row[columnKey] ?? ''));
-    });
-    return Array.from(valueSet).sort();
-  }, [rows]);
-
-  // Export filtered & selected data
-  const exportData = useCallback(() => {
-    if (filteredRows.length === 0 || visibleColumns.length === 0) return;
-
-    const exportRows = filteredRows.map(row => {
-      const newRow: RowData = {};
-      visibleColumns.forEach(col => {
-        newRow[col.key] = row[col.key];
+    setLoading(true);
+    try {
+      await invoke('export_data', {
+        sheetName: activeSheet,
+        selectedColumns: selectedColumnKeys,
+        filters,
+        outputPath,
       });
-      return newRow;
-    });
+    } finally {
+      setLoading(false);
+    }
+  }, [activeSheet, selectedColumnKeys, filters, fileName]);
 
-    const ws = XLSX.utils.json_to_sheet(exportRows);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
-
-    const baseName = fileName.replace(/\.[^/.]+$/, '');
-    XLSX.writeFile(wb, `${baseName}_exported.xlsx`);
-  }, [filteredRows, visibleColumns, fileName]);
-
-  const reset = useCallback(() => {
+  // Reset / close
+  const reset = useCallback(async () => {
+    await invoke('close_file');
     setFileName('');
     setColumns([]);
-    setRows([]);
+    setPageRows([]);
     setSelectedColumnKeys([]);
     setFilters({});
     setSheetNames([]);
     setActiveSheet('');
-    setWorkbook(null);
+    setTotalRows(0);
+    setFilteredTotal(0);
   }, []);
 
   return {
     fileName,
     columns,
-    rows,
     selectedColumnKeys,
-    setSelectedColumnKeys,
+    setSelectedColumnKeys: updateSelectedColumns,
     filters,
     updateFilter,
     clearAllFilters,
     visibleColumns,
-    filteredRows,
-    getColumnUniqueValues,
     loading,
     sheetNames,
     activeSheet,
     switchSheet,
-    loadFile,
+    openFile,
     exportData,
     reset,
+    // Pagination
+    pageRows,
+    totalRows,
+    filteredTotal,
+    currentPage,
+    pageSize,
+    onPageChange,
+    getColumnUniqueValues,
   };
 }

@@ -11,22 +11,26 @@ function App() {
   const {
     fileName,
     columns,
-    rows,
     selectedColumnKeys,
     setSelectedColumnKeys,
     filters,
     updateFilter,
     clearAllFilters,
     visibleColumns,
-    filteredRows,
-    getColumnUniqueValues,
     loading,
     sheetNames,
     activeSheet,
     switchSheet,
-    loadFile,
+    openFile,
     exportData,
     reset,
+    pageRows,
+    totalRows,
+    filteredTotal,
+    currentPage,
+    pageSize,
+    onPageChange,
+    getColumnUniqueValues,
   } = useExcelData();
 
   const hasFile = fileName !== '';
@@ -47,9 +51,9 @@ function App() {
             <div className="app-upload-inner">
               <h1 className="app-title">Excel 列选择工具</h1>
               <p className="app-subtitle">
-                上传 Excel 文件，以树形结构快速选择列、筛选数据并导出
+                选择 Excel 文件，以树形结构快速选择列、筛选数据并导出
               </p>
-              <FileUpload onFileLoad={loadFile} loading={loading} />
+              <FileUpload onOpenFile={openFile} loading={loading} />
             </div>
           </div>
         ) : (
@@ -64,8 +68,8 @@ function App() {
                 onReset={reset}
                 onClearFilters={clearAllFilters}
                 hasFilters={Object.keys(filters).length > 0}
-                rowCount={rows.length}
-                filteredRowCount={filteredRows.length}
+                rowCount={totalRows}
+                filteredRowCount={filteredTotal}
                 columnCount={columns.length}
                 selectedColumnCount={selectedColumnKeys.length}
               />
@@ -80,8 +84,12 @@ function App() {
                 <main className="app-main">
                   <DataTable
                     columns={visibleColumns}
-                    rows={filteredRows}
-                    totalRows={rows.length}
+                    rows={pageRows}
+                    totalRows={totalRows}
+                    filteredTotal={filteredTotal}
+                    currentPage={currentPage}
+                    pageSize={pageSize}
+                    onPageChange={onPageChange}
                     filters={filters}
                     onFilterChange={updateFilter}
                     getColumnUniqueValues={getColumnUniqueValues}

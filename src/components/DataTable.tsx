@@ -1,4 +1,4 @@
-import { useMemo, useCallback } from 'react';
+import { useMemo, useCallback, useState, useEffect } from 'react';
 import { Table, Typography, Empty } from 'antd';
 import type { ColumnsType, ColumnType } from 'antd/es/table';
 import type { ColumnInfo, RowData } from '../types';
@@ -9,22 +9,48 @@ interface DataTableProps {
   columns: ColumnInfo[];
   rows: RowData[];
   totalRows: number;
+  filteredTotal: number;
+  currentPage: number;
+  pageSize: number;
+  onPageChange: (page: number, pageSize: number) => void;
   filters: Record<string, string[]>;
   onFilterChange: (column: string, values: string[]) => void;
-  getColumnUniqueValues: (columnKey: string) => string[];
+  getColumnUniqueValues: (columnKey: string) => Promise<string[]>;
 }
 
 export default function DataTable({
   columns,
   rows,
   totalRows,
+  filteredTotal,
+  currentPage,
+  pageSize,
+  onPageChange,
   filters,
   onFilterChange,
   getColumnUniqueValues,
 }: DataTableProps) {
+  // Cache for column unique values (loaded lazily)
+  const [uniqueValuesCache, setUniqueValuesCache] = useState<Record<string, string[]>>({});
+
+  // Clear cache when filters change so we get updated values
+  useEffect(() => {
+    setUniqueValuesCache({});
+  }, [filters]);
+
+  // Load unique values for a column on demand (when filter dropdown opens)
+  const loadUniqueValues = useCallback(
+    async (columnKey: string) => {
+      if (uniqueValuesCache[columnKey]) return;
+      const values = await getColumnUniqueValues(columnKey);
+      setUniqueValuesCache((prev) => ({ ...prev, [columnKey]: values }));
+    },
+    [uniqueValuesCache, getColumnUniqueValues]
+  );
+
   const buildTableColumns = useMemo((): ColumnsType<RowData> => {
     return columns.map((col) => {
-      const uniqueValues = getColumnUniqueValues(col.key);
+      const cached = uniqueValuesCache[col.key];
       const tableCol: ColumnType<RowData> = {
         title: col.title,
         dataIndex: col.key,
@@ -36,38 +62,58 @@ export default function DataTable({
           const vb = String(b[col.key] ?? '');
           return va.localeCompare(vb, undefined, { numeric: true });
         },
-        filters: uniqueValues.map(v => ({ text: v === '' ? '(空)' : String(v), value: v })),
+        filters: cached
+          ? cached.map((v) => ({ text: v === '' ? '(空)' : v, value: v }))
+          : [],
         filteredValue: filters[col.key] || null,
-        onFilter: (value, record) => {
-          return String(record[col.key] ?? '') === String(value);
+        filterDropdownProps: {
+          onOpenChange: (open: boolean) => {
+            if (open) loadUniqueValues(col.key);
+          },
         },
       };
       return tableCol;
     });
-  }, [columns, filters, getColumnUniqueValues]);
+  }, [columns, filters, uniqueValuesCache, loadUniqueValues]);
 
   const handleTableChange = useCallback(
-    (_pagination: unknown, tableFilters: Record<string, (React.Key | boolean)[] | null>) => {
-      // Sync table filters back to our state
-      columns.forEach(col => {
-        const newFilterValues = tableFilters[col.key];
-        if (newFilterValues) {
-          onFilterChange(col.key, newFilterValues.map(String));
-        } else {
+    (
+      pagination: { current?: number; pageSize?: number },
+      tableFilters: Record<string, (React.Key | boolean)[] | null>
+    ) => {
+      // Handle filter changes
+      let filtersChanged = false;
+      columns.forEach((col) => {
+        const newValues = tableFilters[col.key];
+        const oldValues = filters[col.key];
+        if (newValues) {
+          const newArr = newValues.map(String);
+          if (!oldValues || JSON.stringify(oldValues) !== JSON.stringify(newArr)) {
+            onFilterChange(col.key, newArr);
+            filtersChanged = true;
+          }
+        } else if (oldValues) {
           onFilterChange(col.key, []);
+          filtersChanged = true;
         }
       });
+
+      // Handle page change (only if filters didn't change — filter change resets to page 0)
+      if (!filtersChanged && pagination.current !== undefined) {
+        const newPage = (pagination.current || 1) - 1; // Ant uses 1-based
+        const newSize = pagination.pageSize || pageSize;
+        onPageChange(newPage, newSize);
+      }
     },
-    [columns, onFilterChange]
+    [columns, filters, pageSize, onFilterChange, onPageChange]
   );
 
-  // Add a row key using index
   const dataWithKeys = useMemo(() => {
     return rows.map((row, index) => ({
       ...row,
-      __rowKey: index,
+      __rowKey: currentPage * pageSize + index,
     }));
-  }, [rows]);
+  }, [rows, currentPage, pageSize]);
 
   if (columns.length === 0) {
     return <Empty description="请先选择要显示的列" />;
@@ -77,7 +123,9 @@ export default function DataTable({
     <div className="data-table">
       <div className="data-table-info">
         <Text type="secondary">
-          显示 {rows.length} / {totalRows} 行，{columns.length} 列
+          共 {totalRows} 行
+          {filteredTotal < totalRows && ` | 筛选后 ${filteredTotal} 行`}
+          ，{columns.length} 列
         </Text>
       </div>
       <Table
@@ -85,11 +133,14 @@ export default function DataTable({
         dataSource={dataWithKeys}
         rowKey="__rowKey"
         size="small"
-        scroll={{ x: columns.length * 150, y: 500 }}
+        virtual
+        scroll={{ x: columns.length * 150, y: 'calc(100vh - 180px)' }}
         pagination={{
-          pageSize: 50,
+          current: currentPage + 1, // Ant is 1-based
+          pageSize,
+          total: filteredTotal,
           showSizeChanger: true,
-          pageSizeOptions: ['20', '50', '100', '200'],
+          pageSizeOptions: ['50', '100', '200', '500'],
           showTotal: (total) => `共 ${total} 条`,
           size: 'small',
         }}
